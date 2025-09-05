@@ -114,29 +114,44 @@ async def send_telegram_message(text, parse_mode=constants.ParseMode.MARKDOWN):
 async def get_gemini_market_insight(symbol, signal_type):
     if not GEMINI_API_KEY:
         print("Gemini API anahtarı ayarlanmamış.")
-        return ""
+        return {"verdict": "neutral", "analysis": "API anahtarı eksik, analiz yapılamadı."}
 
-    user_query = f"Provide a very short, single-paragraph analysis about the market state for {symbol} based on a '{signal_type}' signal from a MACD strategy."
-    
+    user_query = f"""
+    You are a financial analyst. Based on a '{signal_type}' signal for {symbol} from a MACD strategy, provide a very short analysis of the market state.
+    Provide your response in JSON format with two keys:
+    1. 'verdict': A single word string. Use 'bullish' for a positive signal, 'bearish' for a negative signal, or 'neutral' if there is no strong conviction.
+    2. 'analysis': A short paragraph explaining your verdict based on real-time market data.
+    """
+
     headers = {
         'Content-Type': 'application/json',
     }
     payload = {
         "contents": [{"parts": [{"text": user_query}]}],
         "tools": [{"google_search": {}}],
-        "systemInstruction": {"parts": [{"text": "You are a world-class financial analyst. Provide a concise, single-paragraph summary of the key findings."}]},
+        "systemInstruction": {"parts": [{"text": "You are a world-class financial analyst. Provide a concise analysis."}]},
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "verdict": {"type": "STRING"},
+                    "analysis": {"type": "STRING"}
+                }
+            }
+        }
     }
     
     async with ClientSession() as session:
         try:
             async with session.post(GEMINI_API_URL, headers=headers, json=payload) as response:
                 result = await response.json()
-                candidate = result.get('candidates', [{}])[0]
-                text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '')
-                return text
+                text_content = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
+                parsed_json = json.loads(text_content)
+                return parsed_json
         except Exception as e:
             print(f"Gemini API'ye bağlanırken hata oluştu: {e}")
-            return ""
+            return {"verdict": "neutral", "analysis": "Gemini analizinde hata oluştu."}
 
 # =========================================================================================
 # ANA BOT DÖNGÜSÜ
@@ -155,38 +170,67 @@ async def run_bot():
     async with ts as stream:
         while True:
             msg = await stream.recv()
-            if msg.get('e') != 'kline' or not msg['k']['x']:
+            if msg.get('e') != 'kline':
                 continue
             
             k = msg['k']
             close_price = float(k['c'])
             
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Yeni bar alındı. Fiyat: {close_price}")
+            # Bu log her yeni fiyat güncellemesinde çalışır, mum kapalı olmasa bile.
+            print(f"Fiyat güncellendi: {close_price}")
 
-            # Mum tamamlandığında stratejiyi çalıştır
-            macd_line, signal_line, histogram = strategy.process_candle(close_price)
-            signal = strategy.get_signal(macd_line, signal_line)
+            if k['x']: # Mum kapalıysa
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Yeni bar alındı. Fiyat: {close_price}")
 
-            if signal:
-                now = time.time()
-                if (now - last_signal_time) < CFG['COOLDOWN_SECONDS']:
-                    continue
-                last_signal_time = now
+                # Mum tamamlandığında stratejiyi çalıştır
+                macd_line, signal_line, histogram = strategy.process_candle(close_price)
+                signal = strategy.get_signal(macd_line, signal_line)
 
-                gemini_insight = await get_gemini_market_insight(CFG['SYMBOL'], signal)
-                
-                message = (
-                    f"**{signal} Sinyali!**\n\n"
-                    f"Bot Adı: {CFG['BOT_NAME']}\n"
-                    f"Sembol: {CFG['SYMBOL']}\n"
-                    f"Zaman Aralığı: {CFG['INTERVAL']}\n"
-                    f"Fiyat: {close_price}\n"
-                    f"MACD: {macd_line:.4f}\n"
-                    f"Sinyal Hattı: {signal_line:.4f}\n"
-                    f"Histogram: {histogram:.4f}\n\n"
-                    f"**Piyasa Analizi:**\n{gemini_insight}"
-                )
-                await send_telegram_message(message)
+                if signal:
+                    now = time.time()
+                    if (now - last_signal_time) < CFG['COOLDOWN_SECONDS']:
+                        continue
+                    last_signal_time = now
+
+                    # Gemini API'den analiz ve karar alma
+                    gemini_insight = await get_gemini_market_insight(CFG['SYMBOL'], signal)
+                    
+                    # Gemini'nin kararını kontrol et
+                    # Eğer AL sinyali ve "bullish" veya SAT sinyali ve "bearish" ise devam et
+                    # Aksi halde, işlemi atla
+                    should_trade = False
+                    if signal == "AL" and gemini_insight.get('verdict') == "bullish":
+                        should_trade = True
+                    elif signal == "SAT" and gemini_insight.get('verdict') == "bearish":
+                        should_trade = True
+
+                    if not should_trade:
+                        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Gemini analizi sinyali desteklemiyor. İşlem iptal edildi. Karar: {gemini_insight.get('verdict')}")
+                        message = (
+                            f"**Sinyal İptal Edildi!**\n\n"
+                            f"Bot Adı: {CFG['BOT_NAME']}\n"
+                            f"Sembol: {CFG['SYMBOL']}\n"
+                            f"Oluşan Sinyal: {signal}\n"
+                            f"**Gemini Kararı: {gemini_insight.get('verdict')}**\n\n"
+                            f"Analiz: {gemini_insight.get('analysis')}"
+                        )
+                        await send_telegram_message(message)
+                        continue
+
+                    # İşlem için her şey uygunsa
+                    message = (
+                        f"**{signal} Sinyali!**\n\n"
+                        f"Bot Adı: {CFG['BOT_NAME']}\n"
+                        f"Sembol: {CFG['SYMBOL']}\n"
+                        f"Zaman Aralığı: {CFG['INTERVAL']}\n"
+                        f"Fiyat: {close_price}\n"
+                        f"MACD: {macd_line:.4f}\n"
+                        f"Sinyal Hattı: {signal_line:.4f}\n"
+                        f"Histogram: {histogram:.4f}\n\n"
+                        f"**Gemini Kararı: {gemini_insight.get('verdict')}**\n"
+                        f"**Piyasa Analizi:**\n{gemini_insight.get('analysis')}"
+                    )
+                    await send_telegram_message(message)
 
     await client.close_connection()
 
