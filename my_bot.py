@@ -149,19 +149,26 @@ async def get_gemini_market_condition(klines):
     
     async with ClientSession() as session:
         try:
-            async with session.post(GEMINI_API_URL, headers=headers, json=payload) as response:
+            async with session.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60) as response:
+                response.raise_for_status() # HTTP hatalarını yakala
                 result = await response.json()
                 text_content = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
                 parsed_json = json.loads(text_content)
                 return parsed_json
         except Exception as e:
             print(f"Gemini API'ye bağlanırken hata oluştu: {e}")
-            return {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu."}
+            # Hata durumunda güvenli bir varsayılan değer döndür
+            return {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu. Varsayılan olarak trend durumu kabul edildi."}
 
 async def get_historical_klines(client, symbol, interval, limit):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {limit} adet geçmiş mum verisi alınıyor...")
-    klines = await client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    return [float(k[4]) for k in klines] # Sadece kapanış fiyatlarını al
+    try:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {limit} adet geçmiş mum verisi alınıyor...")
+        klines = await client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        return [float(k[4]) for k in klines] # Sadece kapanış fiyatlarını al
+    except Exception as e:
+        print(f"Geçmiş mum verisi alınırken hata oluştu: {e}")
+        return None
+
 
 # =========================================================================================
 # ANA BOT DÖNGÜSÜ
@@ -177,13 +184,26 @@ async def run_bot():
     
     # Bot başlatılırken geçmiş veriyi al ve Gemini'ye gönder
     historical_klines = await get_historical_klines(client, CFG['SYMBOL'], CFG['INTERVAL'], CFG['HISTORICAL_DATA_COUNT'])
+    
+    # Geçmiş veri alınamazsa botu başlatma
+    if not historical_klines:
+        error_message = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Geçmiş veri alınamadı, bot başlatılamıyor."
+        print(error_message)
+        await send_telegram_message(error_message)
+        await client.close_connection()
+        return
+
+    # Gemini'den piyasa durumu analizi al
     gemini_market_state = await get_gemini_market_condition(historical_klines)
-    market_condition = gemini_market_state.get('verdict')
+    
+    # Gemini analizi başarısız olursa varsayılan duruma geç
+    market_condition = gemini_market_state.get('verdict', 'trending') # Hata durumunda varsayılan olarak 'trending' ayarla
+    analysis = gemini_market_state.get('analysis', 'Gemini analizi alınamadı.')
 
     initial_message = (
         f"**İlk Piyasa Analizi Hazır!**\n"
         f"Durum: **{market_condition.upper()}**\n"
-        f"Analiz: {gemini_market_state.get('analysis')}\n\n"
+        f"Analiz: {analysis}\n\n"
         f"Bot mevcut piyasa durumuna göre işlemlerine başlayacaktır."
     )
     await send_telegram_message(initial_message)
