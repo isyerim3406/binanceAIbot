@@ -1,154 +1,273 @@
+import asyncio
 import os
+import time
+from datetime import datetime, timezone
+from binance import AsyncClient, BinanceSocketManager
+from dotenv import load_dotenv
+import telegram
+from telegram import constants
 import requests
 import json
-import time
-import pandas as pd
-from binance.client import Client
-from telegram import Bot
 
-# Bu betik, MACD stratejisine göre alım/satım sinyalleri üretir ve bunları tradingview_bridge.py'ye gönderir.
-# Binance API anahtarları boş bırakılırsa, bot simülasyon modunda çalışır ve gerçek işlem yapmaz.
-# Ayrıca ürettiği sinyalleri Telegram'a bildirim olarak gönderir.
+# .env dosyasını yükle
+load_dotenv()
 
 # =========================================================================================
-# API VE AYARLAR
+# GEMINI İLE İLETİŞİM
 # =========================================================================================
-# Binance API anahtarları (sadece veri çekmek için gerekli, işlem yapmak için değil)
-BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
-BINANCE_SECRET = os.environ.get('BINANCE_SECRET')
+async def generate_gemini_commentary(prompt):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("Gemini API anahtarı ayarlanmamış.")
+        return "Gemini yorumu alınamadı."
 
-# Telegram Bot token'ı ve sohbet kimliği (chat ID)
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
 
-# Botun gerçek modda mı yoksa simülasyon modunda mı olduğunu kontrol eder
-SIMULATION_MODE = not BINANCE_API_KEY or not BINANCE_SECRET
-print(f"Bot {'SIMÜLASYON' if SIMULATION_MODE else 'GERÇEK'} modda çalışıyor.")
-
-# Webhook URL'si: tradingview_bridge.py dosyasının çalıştığı adres ve port.
-WEBHOOK_URL = "http://localhost:5000/webhook"
-# Sinyalleri doğrulamak için gizli anahtar
-SECRET_KEY = "YOUR_STRONG_SECRET_KEY"
-
-# Bot ayarları
-SYMBOL = 'BTCUSDT'
-INTERVAL = Client.KLINE_INTERVAL_1HOUR  # 1 saatlik veriler
-QUANTITY = 0.001  # İşlem miktarı
-RSI_PERIOD = 14
-MACD_FAST_PERIOD = 12
-MACD_SLOW_PERIOD = 26
-MACD_SIGNAL_PERIOD = 9
-
-# =========================================================================================
-# TEKNİK ANALİZ FONKSİYONLARI
-# =========================================================================================
-def calculate_macd(df, fast_period, slow_period, signal_period):
-    """MACD ve sinyal çizgisi hesaplaması."""
-    df['ema_fast'] = df['close'].ewm(span=fast_period, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=slow_period, adjust=False).mean()
-    df['macd'] = df['ema_fast'] - df['ema_slow']
-    df['macd_signal'] = df['macd'].ewm(span=signal_period, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-    return df
-
-# =========================================================================================
-# SİNYAL GÖNDERME FONKSİYONLARI
-# =========================================================================================
-def send_telegram_message(message: str):
-    """Telegram'a mesaj gönderir."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram API bilgileri eksik. Mesaj gönderilemedi.")
-        return
-    try:
-        telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-        print("Telegram'a bildirim başarıyla gönderildi.")
-    except Exception as e:
-        print(f"Telegram'a mesaj gönderme sırasında bir hata oluştu: {e}")
-
-def send_signal_to_bridge(symbol: str, signal: str, quantity: float):
-    """
-    Belirtilen parametrelerle web sunucusuna bir sinyal gönderir.
-    """
     payload = {
-        "secret": SECRET_KEY,
-        "symbol": symbol,
-        "signal": signal,
-        "quantity": quantity
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}]
     }
-    headers = {'Content-Type': 'application/json'}
-
-    print(f"Sinyal gönderiliyor: {symbol} için {signal}")
-    if SIMULATION_MODE:
-        message = f"Simülasyon Modu: {symbol} için {signal} sinyali üretildi. Gerçek işlem yapılmadı."
-        print(message)
-        send_telegram_message(message)
-        return
 
     try:
-        response = requests.post(WEBHOOK_URL, data=json.dumps(payload), headers=headers)
+        response = requests.post(
+            api_url,
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(payload),
+            timeout=10 # 10 saniye zaman aşımı
+        )
         response.raise_for_status()
         result = response.json()
-        print("Sinyal başarıyla gönderildi. Sunucu yanıtı:", result)
         
-        # Başarılı sipariş sonrası Telegram'a bildirim gönder
-        message = f"✅ İşlem Başarılı!\nSembol: {symbol}\nSinyal: {signal}\nMiktar: {quantity}"
-        send_telegram_message(message)
-
+        # Yanıttan yorumu çıkar
+        candidate = result.get('candidates', [{}])[0]
+        text_part = candidate.get('content', {}).get('parts', [{}])[0]
+        commentary = text_part.get('text', "Yorum alınamadı.")
+        return commentary
     except requests.exceptions.RequestException as e:
-        print(f"Sinyal gönderme sırasında hata: {e}")
-        message = f"❌ İşlem Hatası!\nSembol: {symbol}\nSinyal: {signal}\nHata: {e}"
-        send_telegram_message(message)
+        print(f"Gemini API hatası: {e}")
+        return "Piyasa yorumu alınamadı."
 
 # =========================================================================================
-# ANA ÇALIŞMA DÖNGÜSÜ
+# MACD STRATEJİSİ SINIFI
 # =========================================================================================
-def run_bot():
-    """Botun ana çalışma döngüsü."""
-    client = Client(BINANCE_API_KEY, BINANCE_SECRET)
+class MACDStrategy:
+    def __init__(self, options=None):
+        options = options or {}
+        self.fast_period = options.get('fast_period', 12)
+        self.slow_period = options.get('slow_period', 26)
+        self.signal_period = options.get('signal_period', 9)
+        self.kline_history = []
+        self.ema_fast = None
+        self.ema_slow = None
+        self.macd_line = []
+        self.signal_line = []
+        self.initial_capital = options.get('initial_capital', 100)
+        self.qty_percent = options.get('qty_percent', 100)
+        self.capital = self.initial_capital
+        self.trades = []
+        self.position_size = 0
+
+    def calculate_ema(self, prices, period, prev_ema):
+        if not prev_ema:
+            return sum(prices) / len(prices)
+        
+        multiplier = 2 / (period + 1)
+        return (prices[-1] - prev_ema) * multiplier + prev_ema
+
+    def process_candle(self, timestamp, close_price):
+        self.kline_history.append(close_price)
+        if len(self.kline_history) > self.slow_period * 2:
+            self.kline_history.pop(0)
+
+        if len(self.kline_history) < self.slow_period:
+            return {'signal': None}
+
+        # EMA hesaplama
+        self.ema_fast = self.calculate_ema(self.kline_history[-self.fast_period:], self.fast_period, self.ema_fast)
+        self.ema_slow = self.calculate_ema(self.kline_history[-self.slow_period:], self.slow_period, self.ema_slow)
+        
+        if self.ema_fast and self.ema_slow:
+            macd_val = self.ema_fast - self.ema_slow
+            self.macd_line.append(macd_val)
+            if len(self.macd_line) > self.signal_period * 2:
+                self.macd_line.pop(0)
+
+            # Sinyal hattı hesaplama
+            if len(self.macd_line) >= self.signal_period:
+                signal_val = self.calculate_ema(self.macd_line[-self.signal_period:], self.signal_period, None)
+                self.signal_line.append(signal_val)
+                
+                if len(self.macd_line) >= 2 and len(self.signal_line) >= 2:
+                    prev_macd = self.macd_line[-2]
+                    prev_signal = self.signal_line[-2]
+                    curr_macd = self.macd_line[-1]
+                    curr_signal = self.signal_line[-1]
+
+                    signal = None
+                    if prev_macd < prev_signal and curr_macd > curr_signal:
+                        signal = {'type': 'BUY', 'message': 'MACD AL Sinyali'}
+                    elif prev_macd > prev_signal and curr_macd < curr_signal:
+                        signal = {'type': 'SELL', 'message': 'MACD SAT Sinyali'}
+
+                    return {'signal': signal}
+
+        return {'signal': None}
     
-    last_signal = None  # Son sinyali takip etmek için değişken
+    def get_avg_entry_price(self):
+        entries = [t for t in self.trades if t['action'] == 'entry']
+        return entries[-1]['price'] if entries else 0.0
+
+    def open_position(self, side, price):
+        qty = (self.capital * (self.qty_percent / 100)) / price
+        self.position_size = qty if side == 'BUY' else -qty
+        self.trades.append({'action': 'entry', 'type': side, 'price': price, 'quantity': qty})
+
+    def close_position(self, price):
+        if self.position_size == 0:
+            return 0.0
+        pnl = self.position_size * (price - self.get_avg_entry_price())
+        self.capital += pnl
+        self.trades.append({'action': 'exit', 'pnl': pnl, 'price': price})
+        self.position_size = 0.0
+        return pnl
+
+# =========================================================================================
+# BOT AYARLARI
+# =========================================================================================
+CFG = {
+    'fast_period': int(os.getenv('FAST_PERIOD', 12)),
+    'slow_period': int(os.getenv('SLOW_PERIOD', 26)),
+    'signal_period': int(os.getenv('SIGNAL_PERIOD', 9)),
+    'TRADE_SIZE_PERCENT': float(os.getenv('TRADE_SIZE_PERCENT', 100)),
+    'SYMBOL': os.getenv('SYMBOL', 'ETHUSDT'),
+    'INTERVAL': os.getenv('INTERVAL', '1h'),
+    'INITIAL_CAPITAL': float(os.getenv('INITIAL_CAPITAL', 100)),
+    'COOLDOWN_SECONDS': int(os.getenv('COOLDOWN_SECONDS', 3600)),
+    'BOT_NAME': os.getenv('BOT_NAME', "MACD Botu Python"),
+    'MODE': os.getenv('MODE', "Simülasyon"),
+    'WEBHOOK_URL': os.getenv('WEBHOOK_URL', 'http://localhost:5000/webhook')
+}
+
+total_net_profit = 0.0
+last_signal_time = 0.0
+
+telegram_bot = None
+if os.getenv('TG_TOKEN') and os.getenv('TG_CHAT_ID'):
+    telegram_bot = telegram.Bot(token=os.getenv('TG_TOKEN'))
+
+macd_strategy = MACDStrategy(options=CFG)
+
+async def send_telegram_message(text):
+    if not telegram_bot or not os.getenv('TG_CHAT_ID'):
+        print("Telegram ayarlı değil veya gerekli ortam değişkenleri eksik.")
+        return
+    await telegram_bot.send_message(
+        chat_id=os.getenv('TG_CHAT_ID'),
+        text=text,
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+
+def send_webhook_signal(symbol, signal_type):
+    payload = {
+        'secret': os.getenv('WEBHOOK_SECRET', 'YOUR_STRONG_SECRET_KEY'),
+        'symbol': symbol,
+        'signal': signal_type
+    }
     
-    while True:
+    # Binance API anahtarları tanımlanmışsa, gerçek işlem modunda çalışır
+    if os.getenv('BINANCE_API_KEY') and os.getenv('BINANCE_SECRET'):
+        url = CFG['WEBHOOK_URL']
         try:
-            # Binance'dan son 500 mum çubuğu verisini çek
-            klines = client.get_klines(symbol=SYMBOL, interval=INTERVAL, limit=500)
-            df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-            
-            # Kapanış fiyatlarını float'a dönüştür
-            df['close'] = pd.to_numeric(df['close'])
-            
-            # MACD'yi hesapla
-            df = calculate_macd(df, MACD_FAST_PERIOD, MACD_SLOW_PERIOD, MACD_SIGNAL_PERIOD)
-            
-            # Son iki MACD ve sinyal değerini al
-            last_macd = df['macd'].iloc[-1]
-            last_macd_signal = df['macd_signal'].iloc[-1]
-            prev_macd = df['macd'].iloc[-2]
-            prev_macd_signal = df['macd_signal'].iloc[-2]
-            
-            # MACD stratejisi:
-            # MACD sinyal çizgisini yukarı keserse AL
-            if prev_macd < prev_macd_signal and last_macd > last_macd_signal:
-                if last_signal != 'BUY':
-                    send_signal_to_bridge(SYMBOL, 'BUY', QUANTITY)
-                    last_signal = 'BUY'
-            
-            # MACD sinyal çizgisini aşağı keserse SAT
-            elif prev_macd > prev_macd_signal and last_macd < last_macd_signal:
-                if last_signal != 'SELL':
-                    send_signal_to_bridge(SYMBOL, 'SELL', QUANTITY)
-                    last_signal = 'SELL'
-            
-            else:
-                print("Yeni sinyal yok. Bekleniyor...")
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+            print(f"Webhook sinyali gönderildi. Yanıt: {response.json()}")
+        except requests.exceptions.RequestException as e:
+            print(f"Webhook sinyali gönderilirken hata oluştu: {e}")
+    else:
+        print("Binance API anahtarları tanımlı değil. Simülasyon modunda çalışıyor.")
 
-            # Her 1 saatte bir tekrarla (veriler 1 saatlik olduğu için)
-            time.sleep(3600)
+# =========================================================================================
+# BOT ANA DÖNGÜSÜ
+# =========================================================================================
+async def run_bot():
+    global total_net_profit, last_signal_time
+    print(f"🤖 {CFG['BOT_NAME']} başlatılıyor...")
 
-        except Exception as e:
-            print(f"Bot döngüsü sırasında bir hata oluştu: {e}")
-            time.sleep(60) # Hata durumunda 1 dakika bekle ve tekrar dene
+    client = await AsyncClient.create()
+    bm = BinanceSocketManager(client)
 
+    # Başlangıçta geçmiş 500 mum
+    candles = await client.get_klines(symbol=CFG['SYMBOL'], interval=CFG['INTERVAL'], limit=500)
+    for c in candles:
+        macd_strategy.process_candle(c[0], float(c[4]))
+
+    # ✅ Bot başlatıldı mesajı
+    msg = (
+        f"**{CFG['BOT_NAME']} Başladı!**\n"
+        f"Mod: {CFG['MODE']}\n"
+        f"Sembol: {CFG['SYMBOL']}\n"
+        f"Zaman Aralığı: {CFG['INTERVAL']}\n"
+    )
+    await send_telegram_message(msg)
+
+    ts = bm.kline_socket(symbol=CFG['SYMBOL'], interval=CFG['INTERVAL'])
+    async with ts as stream:
+        while True:
+            kmsg = await stream.recv()
+            if kmsg.get('e') != 'kline':
+                continue
+            k = kmsg['k']
+            if k['x']: # Mum kapandığında
+                ts = k['t']
+                close_price = float(k['c'])
+
+                # 📊 Bar kapanışını logla
+                ts_str = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime('%d.%m.%Y %H:%M:%S')
+                print(f"📊 Yeni bar alındı | Sembol: {CFG['SYMBOL']} | Zaman Aralığı: {CFG['INTERVAL']} | Kapanış: {close_price:.2f} | {ts_str}")
+
+                result = macd_strategy.process_candle(ts, close_price)
+                if result['signal']:
+                    now = time.time()
+                    if last_signal_time and (now - last_signal_time) < CFG['COOLDOWN_SECONDS']:
+                        continue
+
+                    side = result['signal']['type']
+                    pnl = macd_strategy.close_position(close_price)
+                    total_net_profit += pnl
+                    macd_strategy.open_position(side, close_price)
+                    last_signal_time = now
+                    
+                    # Webhook sinyali gönder
+                    send_webhook_signal(CFG['SYMBOL'], side)
+
+                    ts_str = datetime.fromtimestamp(ts/1000, timezone.utc).strftime("%d.%m.%Y - %H:%M")
+                    percent_pnl = (pnl / macd_strategy.initial_capital) * 100 if macd_strategy.initial_capital else 0
+                    total_percent = (total_net_profit / macd_strategy.initial_capital) * 100 if macd_strategy.initial_capital else 0
+                    
+                    # Gemini API'den piyasa yorumu al
+                    prompt = (f"{CFG['SYMBOL']} {CFG['INTERVAL']} zaman aralığında {side} sinyali verdi. "
+                              f"Bu sinyalin oluştuğu anki piyasa hakkında kısa, uzman bir yorum yap.")
+                    gemini_commentary = await generate_gemini_commentary(prompt)
+
+                    msg = (
+                        f"**{side} Emri Gerçekleşti!**\n\n"
+                        f"Bot Adı: {CFG['BOT_NAME']}\n"
+                        f"Mod: {CFG['MODE']}\n"
+                        f"Sembol: {CFG['SYMBOL']}\n"
+                        f"Zaman Aralığı: {CFG['INTERVAL']}\n"
+                        f"Sinyal:{result['signal']['message']}\n"
+                        f"Fiyat:{close_price}\n"
+                        f"Zaman : {ts_str}\n"
+                        f"Bu İşlemden Kar/Zarar : % {percent_pnl:.2f} ({pnl:.2f} USDT)\n"
+                        f"Toplam Net Kar/Zarar : % {total_percent:.2f} ({total_net_profit:.2f} USDT)\n\n"
+                        f"**Piyasa Yorumu:**\n{gemini_commentary}"
+                    )
+                    await send_telegram_message(msg)
+
+    await client.close_connection()
+
+# =========================================================================================
+# UYGULAMAYI ÇALIŞTIR
+# =========================================================================================
 if __name__ == '__main__':
-    run_bot()
+    asyncio.run(run_bot())
