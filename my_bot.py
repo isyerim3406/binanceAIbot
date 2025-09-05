@@ -156,11 +156,18 @@ async def get_gemini_market_condition(klines):
                 candidate = result.get('candidates', [None])[0]
                 if not candidate:
                     print("Gemini API'den geçerli aday (candidate) bulunamadı.")
-                    # Hata durumunda güvenli bir varsayılan değer döndür
                     return {"verdict": "trending", "analysis": "Geçersiz Gemini API yanıtı."}
 
                 text_content = candidate.get('content', {}).get('parts', [{}])[0].get('text', '{}')
                 parsed_json = json.loads(text_content)
+                
+                # Gelen verinin beklenen tipte olup olmadığını kontrol et
+                verdict = parsed_json.get('verdict')
+                analysis = parsed_json.get('analysis')
+                if not isinstance(verdict, str) or not isinstance(analysis, str):
+                    print("Gemini API yanıtındaki 'verdict' veya 'analysis' anahtarları string değil.")
+                    return {"verdict": "trending", "analysis": "Gemini yanıtı geçerli formatta değil."}
+
                 return parsed_json
         except json.JSONDecodeError:
             print("Gemini API yanıtı geçerli JSON değil.")
@@ -177,7 +184,6 @@ async def get_historical_klines(client, symbol, interval, limit):
     except Exception as e:
         print(f"Geçmiş mum verisi alınırken hata oluştu: {e}")
         return None
-
 
 # =========================================================================================
 # ANA BOT DÖNGÜSÜ
@@ -205,13 +211,19 @@ async def run_bot():
     # Gemini'den piyasa durumu analizi al
     gemini_market_state = await get_gemini_market_condition(historical_klines)
     
-    # Güvenlik için ekstra kontrol: eğer yanıt geçerli bir dict değilse
+    # Gelen yanıtın mutlaka bir sözlük olduğunu garanti altına al
     if not isinstance(gemini_market_state, dict):
-        gemini_market_state = {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu."}
+        print("Gemini'den gelen yanıt sözlük değil. Varsayılan değerler kullanılıyor.")
+        gemini_market_state = {"verdict": "trending", "analysis": "Geçersiz yanıt tipi."}
 
-    # Gemini analizi başarısız olursa varsayılan duruma geç
     market_condition = gemini_market_state.get('verdict', 'trending')
     analysis = gemini_market_state.get('analysis', 'Gemini analizi alınamadı.')
+
+    # Ekstra güvenlik kontrolü: Eğer market_condition bir string değilse, varsayılan değer ata
+    if not isinstance(market_condition, str):
+        market_condition = 'trending'
+        analysis = "API'den geçersiz piyasa durumu verisi alındı. Varsayılan olarak trend durumu kabul edildi."
+        print(analysis)
 
     initial_message = (
         f"**İlk Piyasa Analizi Hazır!**\n"
