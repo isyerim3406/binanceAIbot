@@ -34,11 +34,8 @@ CFG = {
 telegram_bot = telegram.Bot(token=os.getenv('TG_TOKEN')) if os.getenv('TG_TOKEN') else None
 TELEGRAM_CHAT_ID = os.getenv('TG_CHAT_ID')
 
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GEMINI_API_KEY}"
-
-# Yeni eklenen Hugging Face API ayarları
-HF_API_TOKEN = os.getenv('HF_API_TOKEN', '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')
+# Hugging Face API ayarları
+HF_API_TOKEN = os.getenv('HF_API_TOKEN')
 HF_API_URL = "https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english"
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
@@ -113,29 +110,10 @@ async def send_telegram_message(message):
         except Exception as e:
             print(f"Telegram mesajı gönderilirken hata oluştu: {e}")
 
-async def query_gemini(prompt):
-    """
-    Gemini API'sine metin sorgusu gönderir ve yanıtı alır.
-    """
-    async with ClientSession() as session:
-        try:
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "contents": [
-                    {"parts": [{"text": prompt}]}
-                ]
-            }
-            async with session.post(GEMINI_API_URL, headers=headers, data=json.dumps(payload)) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return data['candidates'][0]['content']['parts'][0]['text']
-        except Exception as e:
-            print(f"Gemini API sorgusunda hata: {e}")
-            return "Gemini'den yanıt alınamadı."
-
 def query_hugging_face(payload):
     """
     Hugging Face Inference API'sine istek gönderen fonksiyon.
+    Payload, API'nin beklentisine uygun olarak biçimlendirilmiş bir sözlük olmalıdır.
     """
     try:
         response = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload)
@@ -201,21 +179,17 @@ async def main():
                             last_signal_time = current_time
 
                             # Hugging Face ile metin analizi yapma örneği
-                            # Bu fonksiyonu, istediğiniz yerde çağırabilirsiniz.
-                            # Şu an için yorum satırı olarak bırakıldı, aktif etmek için baştaki '#' işaretini kaldırın.
-                            # Örneğin, yukarıdaki sinyal mesajını analiz edebiliriz.
-                            # try:
-                            #     sentiment_data = query_hugging_face({"inputs": f"Bir {signal} sinyali geldi. Fiyat: {close_price}"})
-                            #     if sentiment_data and sentiment_data[0]:
-                            #         sentiment_label = sentiment_data[0][0]['label']
-                            #         sentiment_score = sentiment_data[0][0]['score']
-                            #         sentiment_message = f"<b>Duygu Analizi:</b> {sentiment_label} (Kesinlik: {sentiment_score:.2f})"
-                            #         await send_telegram_message(sentiment_message)
-                            # except Exception as e:
-                            #     print(f"Duygu analizi gönderilirken hata oluştu: {e}")
+                            try:
+                                sentiment_data = query_hugging_face({"inputs": f"Bir {signal} sinyali geldi. Fiyat: {close_price}"})
+                                if sentiment_data and sentiment_data[0]:
+                                    sentiment_label = sentiment_data[0][0]['label']
+                                    sentiment_score = sentiment_data[0][0]['score']
+                                    sentiment_message = f"<b>Duygu Analizi:</b> {sentiment_label} (Kesinlik: {sentiment_score:.2f})"
+                                    await send_telegram_message(sentiment_message)
+                            except Exception as e:
+                                print(f"Duygu analizi gönderilirken hata oluştu: {e}")
 
             await asyncio.sleep(1) # CPU kullanımını azaltmak için bekle
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
