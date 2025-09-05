@@ -1,5 +1,6 @@
-flask
+python-dotenv
 python-binance
+Flask
 requests
-pandas
 python-telegram-bot
+pandas
