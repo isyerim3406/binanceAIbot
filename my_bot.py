@@ -151,30 +151,33 @@ async def get_gemini_market_condition(klines):
         try:
             async with session.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60) as response:
                 response.raise_for_status() # HTTP hatalarını yakala
+                
                 result = await response.json()
                 
                 candidate = result.get('candidates', [None])[0]
                 if not candidate:
                     print("Gemini API'den geçerli aday (candidate) bulunamadı.")
-                    return {"verdict": "trending", "analysis": "Geçersiz Gemini API yanıtı."}
+                    return {"verdict": "trending", "analysis": "API'den geçerli yanıt alınamadı. Lütfen daha sonra tekrar deneyin."}
 
                 text_content = candidate.get('content', {}).get('parts', [{}])[0].get('text', '{}')
-                parsed_json = json.loads(text_content)
                 
-                # Gelen verinin beklenen tipte olup olmadığını kontrol et
+                try:
+                    parsed_json = json.loads(text_content)
+                except json.JSONDecodeError:
+                    print(f"Gemini API yanıtı geçerli JSON değil. Ham yanıt: {text_content}")
+                    return {"verdict": "trending", "analysis": "API yanıtı geçerli bir JSON değil. Sorun devam ederse lütfen yöneticinizle iletişime geçin."}
+                
                 verdict = parsed_json.get('verdict')
                 analysis = parsed_json.get('analysis')
                 if not isinstance(verdict, str) or not isinstance(analysis, str):
                     print("Gemini API yanıtındaki 'verdict' veya 'analysis' anahtarları string değil.")
-                    return {"verdict": "trending", "analysis": "Gemini yanıtı geçerli formatta değil."}
+                    return {"verdict": "trending", "analysis": "API yanıtı beklenen formatta değil. Varsayılan trend durumu kullanılıyor."}
 
                 return parsed_json
-        except json.JSONDecodeError:
-            print("Gemini API yanıtı geçerli JSON değil.")
-            return {"verdict": "trending", "analysis": "Gemini yanıtı JSON olarak çözümlenemedi."}
         except Exception as e:
-            print(f"Gemini API'ye bağlanırken hata oluştu: {e}")
-            return {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu. Varsayılan olarak trend durumu kabul edildi."}
+            error_message = f"Gemini API'ye bağlanırken veya yanıtı işlerken bir hata oluştu: {str(e)}"
+            print(error_message)
+            return {"verdict": "trending", "analysis": f"API'ye ulaşılamadı. Hata: {str(e)}"}
 
 async def get_historical_klines(client, symbol, interval, limit):
     try:
@@ -197,10 +200,8 @@ async def run_bot():
     
     client = await AsyncClient.create()
     
-    # Bot başlatılırken geçmiş veriyi al ve Gemini'ye gönder
     historical_klines = await get_historical_klines(client, CFG['SYMBOL'], CFG['INTERVAL'], CFG['HISTORICAL_DATA_COUNT'])
     
-    # Geçmiş veri alınamazsa botu başlatma
     if not historical_klines:
         error_message = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Geçmiş veri alınamadı, bot başlatılamıyor."
         print(error_message)
@@ -208,10 +209,8 @@ async def run_bot():
         await client.close_connection()
         return
 
-    # Gemini'den piyasa durumu analizi al
     gemini_market_state = await get_gemini_market_condition(historical_klines)
     
-    # Gelen yanıtın mutlaka bir sözlük olduğunu garanti altına al
     if not isinstance(gemini_market_state, dict):
         print("Gemini'den gelen yanıt sözlük değil. Varsayılan değerler kullanılıyor.")
         gemini_market_state = {"verdict": "trending", "analysis": "Geçersiz yanıt tipi."}
@@ -219,7 +218,6 @@ async def run_bot():
     market_condition = gemini_market_state.get('verdict', 'trending')
     analysis = gemini_market_state.get('analysis', 'Gemini analizi alınamadı.')
 
-    # Ekstra güvenlik kontrolü: Eğer market_condition bir string değilse, varsayılan değer ata
     if not isinstance(market_condition, str):
         market_condition = 'trending'
         analysis = "API'den geçersiz piyasa durumu verisi alındı. Varsayılan olarak trend durumu kabul edildi."
@@ -250,7 +248,6 @@ async def run_bot():
             if k['x']: # Mum kapalıysa
                 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Yeni bar alındı. Fiyat: {close_price}")
 
-                # Mum tamamlandığında stratejiyi çalıştır
                 macd_line, signal_line, histogram = strategy.process_candle(close_price)
                 signal = strategy.get_signal(macd_line, signal_line)
 
@@ -260,7 +257,6 @@ async def run_bot():
                         continue
                     last_signal_time = now
 
-                    # Piyasa durumu 'yatay' ise işlemi atla
                     if market_condition == 'sideways':
                         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Piyasa yatay. Sinyal reddedildi.")
                         message = (
@@ -273,7 +269,6 @@ async def run_bot():
                         await send_telegram_message(message)
                         continue
 
-                    # Piyasa durumu 'trend' ise işleme devam et
                     message = (
                         f"**{signal} Sinyali!**\n\n"
                         f"Bot Adı: {CFG['BOT_NAME']}\n"
