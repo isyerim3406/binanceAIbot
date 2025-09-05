@@ -6,9 +6,9 @@ from binance import AsyncClient, BinanceSocketManager
 from dotenv import load_dotenv
 import telegram
 from telegram import constants
-from aiohttp import ClientSession
 import json
 import requests
+import numpy as np
 
 # .env dosyasını yükle
 load_dotenv()
@@ -25,7 +25,9 @@ CFG = {
     'COOLDOWN_SECONDS': int(os.getenv('COOLDOWN_SECONDS', 10)),
     'BOT_NAME': os.getenv('BOT_NAME', 'Binance MACD Botu'),
     'MODE': os.getenv('MODE', 'Simülasyon'),
-    'HISTORICAL_DATA_COUNT': int(os.getenv('HISTORICAL_DATA_COUNT', 1000))
+    'HISTORICAL_DATA_COUNT': int(os.getenv('HISTORICAL_DATA_COUNT', 1000)),
+    'VOLATILITY_PERIOD': int(os.getenv('VOLATILITY_PERIOD', 20)),
+    'VOLATILITY_THRESHOLD': float(os.getenv('VOLATILITY_THRESHOLD', 0.005)) # Piyasa yataysa standart sapma eşiği
 }
 
 # =========================================================================================
@@ -61,6 +63,9 @@ class MACDStrategy:
     def process_candle(self, close_price):
         self.closes.append(close_price)
         
+        if len(self.closes) > CFG['HISTORICAL_DATA_COUNT']:
+            self.closes.pop(0)
+
         if len(self.closes) < max(CFG['MACD_FAST_PERIOD'], CFG['MACD_SLOW_PERIOD']):
             return None, None, None
         
@@ -93,6 +98,24 @@ class MACDStrategy:
         self.prev_signal_line = signal_line
         
         return signal
+        
+    def is_market_sideways(self):
+        """
+        Son N kapanış fiyatlarının standart sapmasını hesaplar.
+        Düşük standart sapma piyasanın yatay olduğunu gösterir.
+        """
+        if len(self.closes) < CFG['VOLATILITY_PERIOD']:
+            return False
+            
+        recent_closes = self.closes[-CFG['VOLATILITY_PERIOD']:]
+        std_dev = np.std(recent_closes)
+        
+        # Standart sapmayı ortalama fiyata göre normalize etmek daha doğru olabilir
+        avg_price = np.mean(recent_closes)
+        normalized_std_dev = std_dev / avg_price
+        
+        return normalized_std_dev < CFG['VOLATILITY_THRESHOLD']
+
 
 # =========================================================================================
 # API VE İLETİŞİM FONKSİYONLARI
@@ -113,7 +136,6 @@ async def send_telegram_message(message):
 def query_hugging_face(payload):
     """
     Hugging Face Inference API'sine istek gönderen fonksiyon.
-    Payload, API'nin beklentisine uygun olarak biçimlendirilmiş bir sözlük olmalıdır.
     """
     try:
         response = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload)
@@ -161,10 +183,12 @@ async def main():
                     
                     if macd_line is not None and signal_line is not None:
                         signal = strategy.get_signal(macd_line, signal_line)
+                        is_sideways = strategy.is_market_sideways()
 
                         current_time = time.time()
                         if signal and (current_time - last_signal_time > CFG['COOLDOWN_SECONDS']):
                             timestamp = datetime.fromtimestamp(kline['T'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                            market_status = "Yatay" if is_sideways else "Trendde"
                             message = f"""
                             <b>{CFG['BOT_NAME']} - {CFG['MODE']} Modu</b>
                             ------------------------------------
@@ -172,6 +196,7 @@ async def main():
                             <b>Sembol:</b> {CFG['SYMBOL']}
                             <b>Mum:</b> {CFG['INTERVAL']}
                             <b>Kapanış Fiyatı:</b> {close_price:.2f}
+                            <b>Piyasa Durumu:</b> {market_status}
                             <b>Zaman:</b> {timestamp}
                             """
                             print(message)
