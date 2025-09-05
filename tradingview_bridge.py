@@ -1,89 +1,75 @@
-import os
 from flask import Flask, request, jsonify
-from binance.client import Client
+import os
+import telegram
+from dotenv import load_dotenv
 
-# Flask uygulamasını başlat
+# .env dosyasını yükle
+load_dotenv()
+
 app = Flask(__name__)
 
 # =========================================================================================
-# API VE AYARLAR
+# TELEGRAM BOT AYARLARI
 # =========================================================================================
-# Binance API anahtarları (Gerçek işlem yapmak için gereklidir)
-BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
-BINANCE_SECRET = os.environ.get('BINANCE_SECRET')
-
-# Sinyalleri doğrulamak için gizli anahtar
-SECRET_KEY = "YOUR_STRONG_SECRET_KEY"
+# Telegram botunuzu başlatın
+telegram_bot = telegram.Bot(token=os.getenv('TG_TOKEN'))
+TELEGRAM_CHAT_ID = os.getenv('TG_CHAT_ID')
 
 # =========================================================================================
-# BİNANCE İŞLEM FONKSİYONU
-# =========================================================================================
-def execute_trade(symbol: str, signal: str, quantity: float):
-    """
-    Belirtilen sembol ve sinyale göre Binance'da işlem emri verir.
-    """
-    if not BINANCE_API_KEY or not BINANCE_SECRET:
-        return {"status": "error", "message": "Binance API anahtarları eksik. İşlem yapılamadı."}
-
-    client = Client(BINANCE_API_KEY, BINANCE_SECRET)
-
-    # Alım veya satım emri
-    if signal == 'BUY':
-        try:
-            order = client.create_order(
-                symbol=symbol,
-                side='BUY',
-                type='MARKET',
-                quantity=quantity
-            )
-            return {"status": "success", "message": "Alım emri başarıyla verildi.", "order": order}
-        except Exception as e:
-            return {"status": "error", "message": f"Alım emri sırasında hata oluştu: {e}"}
-    elif signal == 'SELL':
-        try:
-            order = client.create_order(
-                symbol=symbol,
-                side='SELL',
-                type='MARKET',
-                quantity=quantity
-            )
-            return {"status": "success", "message": "Satım emri başarıyla verildi.", "order": order}
-        except Exception as e:
-            return {"status": "error", "message": f"Satım emri sırasında hata oluştu: {e}"}
-    else:
-        return {"status": "error", "message": "Geçersiz sinyal. (BUY veya SELL olmalı)"}
-
-# =========================================================================================
-# WEBHOOK ENDPOİNT'İ
+# WEBHOOK ENDPOİNTİ
+# Bu endpoint, my_bot.py dosyasından gelen POST sinyallerini alır.
 # =========================================================================================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """
-    My_bot.py'den gelen sinyal isteğini işler.
-    """
     data = request.json
     
-    # Gizli anahtarı kontrol et
-    if data.get('secret') != SECRET_KEY:
-        return jsonify({"status": "error", "message": "Gizli anahtar eşleşmiyor. İzinsiz erişim."}), 403
+    # Güvenlik kontrolü için SECRET anahtarını kontrol et
+    if data.get('secret') != os.getenv('WEBHOOK_SECRET'):
+        return jsonify({"code": "error", "message": "Geçersiz güvenlik anahtarı"}), 401
 
     symbol = data.get('symbol')
-    signal = data.get('signal')
-    quantity = data.get('quantity')
+    signal_type = data.get('signal')
 
-    if not all([symbol, signal, quantity]):
-        return jsonify({"status": "error", "message": "Eksik parametreler. (symbol, signal, quantity)"}), 400
+    if not symbol or not signal_type:
+        return jsonify({"code": "error", "message": "Eksik parametreler"}), 400
 
-    print(f"Sinyal alındı: {symbol} için {signal} sinyali geldi.")
-    
-    # Gerçek işlemi gerçekleştir
-    result = execute_trade(symbol, signal, quantity)
-    
-    return jsonify(result), 200
+    message = f"**TradingView Sinyali Alındı**\n\nSembol: {symbol}\nSinyal: {signal_type}"
+    asyncio.run(send_telegram_message(message))
+
+    return jsonify({"code": "ok", "message": "Sinyal başarıyla alındı ve işlendi"}), 200
 
 # =========================================================================================
-# UYGULAMA BAŞLANGICI
+# DURUM VE SAĞLIK KONTROLÜ ENDPOİNTLERİ
+# Bunlar, sunucunun çalışıp çalışmadığını kontrol etmek içindir.
+# =========================================================================================
+@app.route('/', methods=['GET'])
+def home():
+    return "TradingView Köprüsü çalışıyor! 🚀"
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    return "OK"
+
+# =========================================================================================
+# TELEGRAM MESAJI GÖNDERME FONKSİYONU
+# =========================================================================================
+async def send_telegram_message(text):
+    if not telegram_bot or not TELEGRAM_CHAT_ID:
+        print("Telegram ayarları eksik. Mesaj gönderilemedi.")
+        return
+    
+    try:
+        await telegram_bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        print(f"Telegram'a mesaj gönderilirken hata oluştu: {e}")
+
+# =========================================================================================
+# UYGULAMAYI BAŞLATMA
 # =========================================================================================
 if __name__ == '__main__':
-    # Flask uygulamasını yerel sunucuda çalıştır
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
