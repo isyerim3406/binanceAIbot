@@ -23,7 +23,8 @@ CFG = {
     'MACD_SIGNAL_PERIOD': int(os.getenv('MACD_SIGNAL_PERIOD', 9)),
     'COOLDOWN_SECONDS': int(os.getenv('COOLDOWN_SECONDS', 10)),
     'BOT_NAME': os.getenv('BOT_NAME', 'Binance MACD Botu'),
-    'MODE': os.getenv('MODE', 'Simülasyon')
+    'MODE': os.getenv('MODE', 'Simülasyon'),
+    'HISTORICAL_DATA_COUNT': int(os.getenv('HISTORICAL_DATA_COUNT', 1000))
 }
 
 # =========================================================================================
@@ -111,16 +112,20 @@ async def send_telegram_message(text, parse_mode=constants.ParseMode.MARKDOWN):
     except Exception as e:
         print(f"Telegram'a mesaj gönderilirken hata oluştu: {e}")
 
-async def get_gemini_market_insight(symbol, signal_type):
+async def get_gemini_market_condition(klines):
     if not GEMINI_API_KEY:
         print("Gemini API anahtarı ayarlanmamış.")
-        return {"verdict": "neutral", "analysis": "API anahtarı eksik, analiz yapılamadı."}
+        return {"verdict": "trending", "analysis": "API anahtarı eksik, analiz yapılamadı."}
 
     user_query = f"""
-    You are a financial analyst. Based on a '{signal_type}' signal for {symbol} from a MACD strategy, provide a very short analysis of the market state.
+    You are a market analyst. Analyze the following list of historical price data (close prices). 
+    Determine if the market is currently in a 'sideways' (range-bound, low volatility) or 'trending' (clear upward or downward movement) state.
+    
+    Price Data: {klines}
+
     Provide your response in JSON format with two keys:
-    1. 'verdict': A single word string. Use 'bullish' for a positive signal, 'bearish' for a negative signal, or 'neutral' if there is no strong conviction.
-    2. 'analysis': A short paragraph explaining your verdict based on real-time market data.
+    1. 'verdict': A single word string. Use 'sideways' if the market is range-bound or 'trending' if there is a clear directional movement.
+    2. 'analysis': A short paragraph explaining your verdict based on the provided data.
     """
 
     headers = {
@@ -151,7 +156,12 @@ async def get_gemini_market_insight(symbol, signal_type):
                 return parsed_json
         except Exception as e:
             print(f"Gemini API'ye bağlanırken hata oluştu: {e}")
-            return {"verdict": "neutral", "analysis": "Gemini analizinde hata oluştu."}
+            return {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu."}
+
+async def get_historical_klines(client, symbol, interval, limit):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {limit} adet geçmiş mum verisi alınıyor...")
+    klines = await client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    return [float(k[4]) for k in klines] # Sadece kapanış fiyatlarını al
 
 # =========================================================================================
 # ANA BOT DÖNGÜSÜ
@@ -164,6 +174,20 @@ async def run_bot():
     await send_telegram_message(f"**{CFG['BOT_NAME']} Başladı!**\n\nSembol: {CFG['SYMBOL']}\nZaman Aralığı: {CFG['INTERVAL']}\nMod: {CFG['MODE']}")
     
     client = await AsyncClient.create()
+    
+    # Bot başlatılırken geçmiş veriyi al ve Gemini'ye gönder
+    historical_klines = await get_historical_klines(client, CFG['SYMBOL'], CFG['INTERVAL'], CFG['HISTORICAL_DATA_COUNT'])
+    gemini_market_state = await get_gemini_market_condition(historical_klines)
+    market_condition = gemini_market_state.get('verdict')
+
+    initial_message = (
+        f"**İlk Piyasa Analizi Hazır!**\n"
+        f"Durum: **{market_condition.upper()}**\n"
+        f"Analiz: {gemini_market_state.get('analysis')}\n\n"
+        f"Bot mevcut piyasa durumuna göre işlemlerine başlayacaktır."
+    )
+    await send_telegram_message(initial_message)
+    
     bm = BinanceSocketManager(client)
     ts = bm.kline_socket(symbol=CFG['SYMBOL'], interval=CFG['INTERVAL'])
 
@@ -176,7 +200,6 @@ async def run_bot():
             k = msg['k']
             close_price = float(k['c'])
             
-            # Bu log her yeni fiyat güncellemesinde çalışır, mum kapalı olmasa bile.
             print(f"Fiyat güncellendi: {close_price}")
 
             if k['x']: # Mum kapalıysa
@@ -192,32 +215,20 @@ async def run_bot():
                         continue
                     last_signal_time = now
 
-                    # Gemini API'den analiz ve karar alma
-                    gemini_insight = await get_gemini_market_insight(CFG['SYMBOL'], signal)
-                    
-                    # Gemini'nin kararını kontrol et
-                    # Eğer AL sinyali ve "bullish" veya SAT sinyali ve "bearish" ise devam et
-                    # Aksi halde, işlemi atla
-                    should_trade = False
-                    if signal == "AL" and gemini_insight.get('verdict') == "bullish":
-                        should_trade = True
-                    elif signal == "SAT" and gemini_insight.get('verdict') == "bearish":
-                        should_trade = True
-
-                    if not should_trade:
-                        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Gemini analizi sinyali desteklemiyor. İşlem iptal edildi. Karar: {gemini_insight.get('verdict')}")
+                    # Piyasa durumu 'yatay' ise işlemi atla
+                    if market_condition == 'sideways':
+                        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Piyasa yatay. Sinyal reddedildi.")
                         message = (
-                            f"**Sinyal İptal Edildi!**\n\n"
+                            f"**Sinyal Reddedildi!**\n\n"
                             f"Bot Adı: {CFG['BOT_NAME']}\n"
                             f"Sembol: {CFG['SYMBOL']}\n"
-                            f"Oluşan Sinyal: {signal}\n"
-                            f"**Gemini Kararı: {gemini_insight.get('verdict')}**\n\n"
-                            f"Analiz: {gemini_insight.get('analysis')}"
+                            f"Oluşan Sinyal: **{signal}**\n\n"
+                            f"**Gemini'ye göre piyasa şu anda yatay olduğu için işlem yapılmadı.**"
                         )
                         await send_telegram_message(message)
                         continue
 
-                    # İşlem için her şey uygunsa
+                    # Piyasa durumu 'trend' ise işleme devam et
                     message = (
                         f"**{signal} Sinyali!**\n\n"
                         f"Bot Adı: {CFG['BOT_NAME']}\n"
@@ -226,9 +237,7 @@ async def run_bot():
                         f"Fiyat: {close_price}\n"
                         f"MACD: {macd_line:.4f}\n"
                         f"Sinyal Hattı: {signal_line:.4f}\n"
-                        f"Histogram: {histogram:.4f}\n\n"
-                        f"**Gemini Kararı: {gemini_insight.get('verdict')}**\n"
-                        f"**Piyasa Analizi:**\n{gemini_insight.get('analysis')}"
+                        f"Histogram: {histogram:.4f}"
                     )
                     await send_telegram_message(message)
 
