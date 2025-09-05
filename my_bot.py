@@ -152,12 +152,21 @@ async def get_gemini_market_condition(klines):
             async with session.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60) as response:
                 response.raise_for_status() # HTTP hatalarını yakala
                 result = await response.json()
-                text_content = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
+                
+                candidate = result.get('candidates', [None])[0]
+                if not candidate:
+                    print("Gemini API'den geçerli aday (candidate) bulunamadı.")
+                    # Hata durumunda güvenli bir varsayılan değer döndür
+                    return {"verdict": "trending", "analysis": "Geçersiz Gemini API yanıtı."}
+
+                text_content = candidate.get('content', {}).get('parts', [{}])[0].get('text', '{}')
                 parsed_json = json.loads(text_content)
                 return parsed_json
+        except json.JSONDecodeError:
+            print("Gemini API yanıtı geçerli JSON değil.")
+            return {"verdict": "trending", "analysis": "Gemini yanıtı JSON olarak çözümlenemedi."}
         except Exception as e:
             print(f"Gemini API'ye bağlanırken hata oluştu: {e}")
-            # Hata durumunda güvenli bir varsayılan değer döndür
             return {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu. Varsayılan olarak trend durumu kabul edildi."}
 
 async def get_historical_klines(client, symbol, interval, limit):
@@ -196,8 +205,12 @@ async def run_bot():
     # Gemini'den piyasa durumu analizi al
     gemini_market_state = await get_gemini_market_condition(historical_klines)
     
+    # Güvenlik için ekstra kontrol: eğer yanıt geçerli bir dict değilse
+    if not isinstance(gemini_market_state, dict):
+        gemini_market_state = {"verdict": "trending", "analysis": "Gemini analizinde hata oluştu."}
+
     # Gemini analizi başarısız olursa varsayılan duruma geç
-    market_condition = gemini_market_state.get('verdict', 'trending') # Hata durumunda varsayılan olarak 'trending' ayarla
+    market_condition = gemini_market_state.get('verdict', 'trending')
     analysis = gemini_market_state.get('analysis', 'Gemini analizi alınamadı.')
 
     initial_message = (
