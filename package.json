@@ -1,17 +1,17 @@
 {
-  "name": "macd-trading-bot",
+  "name": "trading-bot",
   "version": "1.0.0",
-  "description": "A trading bot using the MACD strategy",
-  "main": "dist/index.js",
+  "description": "A cryptocurrency trading bot.",
+  "main": "index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node index.js",
+    "build": "echo 'Nothing to build'"
   },
   "dependencies": {
-    "dotenv": "^16.3.1"
-    // Diğer bağımlılıklar...
+    "dotenv": "^16.4.5"
+    // Diğer bağımlılıklarınızı buraya ekleyebilirsiniz.
   },
-  "devDependencies": {
-    "typescript": "^5.3.3"
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
